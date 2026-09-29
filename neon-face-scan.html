@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Neon Face Scan</title>
+<style>
+  :root {
+    --void: #04060a;
+    --panel: rgba(8, 14, 20, 0.72);
+    --line: rgba(140, 190, 210, 0.18);
+    --dim: #6d8794;
+    --bright: #cfe6ef;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--void);
+    color: var(--bright);
+    font-family: var(--mono);
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #stage {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  #cam { display: none; }
+
+  /* HUD */
+  .hud {
+    position: fixed;
+    z-index: 4;
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    color: var(--dim);
+    text-shadow: 0 0 12px rgba(0, 0, 0, 0.9);
+    pointer-events: none;
+  }
+
+  #fps {
+    left: 18px;
+    bottom: 16px;
+    font-size: 20px;
+    color: var(--bright);
+    font-variant-numeric: tabular-nums;
+  }
+
+  #readout {
+    left: 18px;
+    top: 16px;
+    line-height: 1.7;
+  }
+
+  #readout b {
+    font-weight: 500;
+    color: var(--bright);
+  }
+
+  #keys {
+    right: 18px;
+    bottom: 16px;
+    text-align: right;
+    line-height: 1.7;
+    opacity: 0.55;
+  }
+
+  #keys kbd {
+    font: inherit;
+    color: var(--bright);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 0 5px;
+  }
+
+  /* Gate */
+  #gate {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    display: grid;
+    place-content: center;
+    justify-items: start;
+    gap: 22px;
+    padding: 32px;
+    background:
+      radial-gradient(120% 90% at 22% 38%, rgba(34, 224, 214, 0.10), transparent 62%),
+      var(--void);
+  }
+
+  #gate h1 {
+    margin: 0;
+    font-size: clamp(28px, 6vw, 46px);
+    font-weight: 400;
+    letter-spacing: -0.02em;
+    color: var(--bright);
+  }
+
+  #gate p {
+    margin: 0;
+    max-width: 46ch;
+    font-size: 14px;
+    line-height: 1.75;
+    color: var(--dim);
+  }
+
+  #go {
+    font: inherit;
+    font-size: 15px;
+    color: #04181a;
+    background: #22e0d6;
+    border: 0;
+    border-radius: 4px;
+    padding: 12px 26px;
+    cursor: pointer;
+    transition: background 0.18s ease;
+  }
+
+  #go:hover { background: #46f0e6; }
+  #go:focus-visible { outline: 2px solid #cfe6ef; outline-offset: 3px; }
+  #go[disabled] { background: #17302f; color: #567; cursor: progress; }
+
+  #err {
+    color: #ff6b5e;
+    font-size: 13px;
+    max-width: 46ch;
+    line-height: 1.7;
+    min-height: 1em;
+  }
+
+  .gone { display: none !important; }
+
+  @media (prefers-reduced-motion: reduce) {
+    #go { transition: none; }
+  }
+</style>
+</head>
+<body>
+
+<video id="cam" playsinline muted></video>
+<canvas id="stage"></canvas>
+
+<div id="readout" class="hud gone">
+  scan <b id="scanState">locked</b><br>
+  fingers <b id="fingerCount">0</b>
+</div>
+
+<div id="fps" class="hud gone">FPS: 0.0</div>
+
+<div id="keys" class="hud gone">
+  <kbd>space</kbd> scatter the scan<br>
+  <kbd>b</kbd> darken<br>
+  <kbd>f</kbd> fullscreen &nbsp; <kbd>h</kbd> hide readouts
+</div>
+
+<section id="gate">
+  <h1>Neon Face Scan</h1>
+  <p>
+    Your face is tracked and drawn as a low-poly wireframe, and a second copy of the
+    mesh floats beside you as a point cloud. Hold up fingers to change the colour.
+    Open your palm to blow the point cloud apart. Everything runs on your device;
+    no video leaves the browser.
+  </p>
+  <button id="go">Start camera</button>
+  <div id="err" role="status"></div>
+</section>
+
+<script type="module">
+import {
+  FilesetResolver,
+  FaceLandmarker,
+  HandLandmarker,
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1";
+
+const WASM  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
+const FACE  = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const HAND  = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+/* ------------------------------------------------------------------ *
+ * Palette. Index = number of extended fingers.
+ * ------------------------------------------------------------------ */
+const PALETTE = [
+  [ 34, 224, 214],  // 0  fist        cyan (default)
+  [ 60, 255,  94],  // 1               green
+  [255, 225,  77],  // 2               yellow
+  [255, 138,  43],  // 3               amber
+  [255,  59,  48],  // 4               red
+  [255,  53, 216],  // 5  open palm    magenta
+];
+const DEFAULT_COLOR = PALETTE[0];
+
+/* ------------------------------------------------------------------ *
+ * Low-poly face mesh, matching the source clip.
+ *
+ * KEY  : the landmark indices used as mesh vertices.
+ * TRI  : a FIXED triangle topology, as triplets of indices INTO KEY.
+ * OVAL : an oval subset, used only to centre the floating scan.
+ *
+ * The topology is fixed, not computed from the live frame. It was built
+ * once by triangulating a neutral, frontal reference face and carving out
+ * the eyes and mouth as open loops. Because it is applied by landmark
+ * index every frame, it deforms with the face and stays clean under head
+ * rotation, instead of tangling the way a cached per-frame triangulation
+ * did.
+ * ------------------------------------------------------------------ */
+const KEY = [0,2,4,5,9,10,17,33,39,50,61,70,93,97,98,101,103,105,107,133,144,145,148,149,151,152,153,158,159,160,162,168,172,181,197,205,263,269,280,291,300,323,326,327,330,332,334,336,362,373,374,377,378,380,385,386,387,389,397,405,425];
+
+const OVAL = [10,389,397,152,172,162];  // oval subset, for centring the floating scan
+
+const TRI = [
+  [45,47,5],[16,11,30],[11,16,17],[40,45,57],[36,40,57],[47,24,5],[22,23,33],[22,6,25],[6,22,33],[35,10,32],[10,23,32],[23,10,33],
+  [12,35,32],[46,47,45],[40,46,45],[47,46,54],[46,40,36],[56,46,36],[31,48,34],[34,48,3],[48,44,3],[48,47,54],[48,31,47],[52,39,58],
+  [39,52,59],[41,36,57],[19,31,34],[19,34,3],[18,19,27],[19,18,31],[17,18,27],[16,18,17],[18,16,5],[24,18,5],[52,51,59],[6,51,25],
+  [51,6,59],[28,17,27],[11,7,30],[7,12,30],[7,11,17],[46,55,54],[55,46,56],[44,49,36],[38,44,36],[41,38,36],[31,4,47],[18,4,31],
+  [4,24,47],[4,18,24],[44,43,3],[43,2,3],[2,14,3],[12,9,35],[7,9,12],[28,29,17],[29,7,17],[50,49,44],[8,10,35],[14,8,35],
+  [38,60,44],[60,43,44],[39,60,58],[37,60,39],[60,37,43],[60,41,58],[60,38,41],[20,15,7],[15,9,7],[15,20,21],[9,15,35],[26,15,21],
+  [15,14,35],[14,15,3],[15,19,3],[15,26,19],[48,53,44],[53,50,44],[37,42,43],[2,42,1],[43,42,2],[42,0,1],[42,37,0],[13,8,14],
+  [13,2,1],[13,14,2],[0,13,1],[8,13,0]
+];
+
+/* ------------------------------------------------------------------ *
+ * DOM
+ * ------------------------------------------------------------------ */
+const video   = document.getElementById("cam");
+const canvas  = document.getElementById("stage");
+const ctx     = canvas.getContext("2d");
+const gate    = document.getElementById("gate");
+const goBtn   = document.getElementById("go");
+const errBox  = document.getElementById("err");
+const fpsEl   = document.getElementById("fps");
+const readout = document.getElementById("readout");
+const keysEl  = document.getElementById("keys");
+const scanEl  = document.getElementById("scanState");
+const fingEl  = document.getElementById("fingerCount");
+
+const hudNodes = [fpsEl, readout, keysEl];
+
+/* ------------------------------------------------------------------ *
+ * State
+ * ------------------------------------------------------------------ */
+let faceLandmarker = null;
+let handLandmarker = null;
+
+// Darken the whole feed so the neon mesh and floating scan read clearly.
+let darkOn = true;           // toggled with 'b'
+
+let smoothFace = null;      // EMA of the live landmarks
+let scanFace   = null;      // slower EMA, feeds the floating point cloud
+
+let colorNow   = DEFAULT_COLOR.slice();   // eased toward the target
+let fingersRaw = 0;
+let fingers    = 0;
+const fingerHistory = [];
+
+let dissolve = 0;           // 0 = solid mesh, 1 = fully scattered
+let dissolveTarget = 0;
+let hudVisible = true;
+
+let lastVideoTime = -1;
+let handTick = 0;
+let fpsAvg = 0;
+let lastFrame = performance.now();
+
+/* ------------------------------------------------------------------ *
+ * Point cloud sampling plan for the floating scan.
+ * Sampling along tessellation edges is what produces the look in the
+ * source clip: dense around eyes, nose and lips where the triangles
+ * are small, sparse across the cheeks and forehead where they are big.
+ * ------------------------------------------------------------------ */
+// Internal buffer runs at a higher resolution than the on-screen size so
+// ~10k points land on distinct pixels instead of piling up. SCAN_H is what
+// the mask actually measures on screen at 720p.
+const MW = 520, MH = 660;
+const SCAN_H = 460;
+const maskCanvas = document.createElement("canvas");
+maskCanvas.width = MW; maskCanvas.height = MH;
+const mctx = maskCanvas.getContext("2d", { willReadFrequently: true });
+const maskImage = mctx.createImageData(MW, MH);
+const acc = new Float32Array(MW * MH);
+// Indices of the pixels a frame actually wrote to. Colorizing walks this
+// list rather than all 343k pixels, which is the difference between ~10k
+// iterations a frame and ~343k.
+const touched = new Int32Array(MW * MH);
+
+let cloud = null;   // { a, b, t, w, sx, sy, sr, ph } per point
+
+function buildCloud() {
+  const tess = FaceLandmarker.FACE_LANDMARKS_TESSELATION;
+  const contour = new Set();
+  for (const c of FaceLandmarker.FACE_LANDMARKS_CONTOURS) {
+    contour.add(c.start); contour.add(c.end);
+  }
+
+  const pts = [];
+  const STRIDE = 1;      // every tessellation edge
+  const SAMPLES = 4;     // points per edge
+
+  for (let i = 0; i < tess.length; i += STRIDE) {
+    const c = tess[i];
+    const hot = contour.has(c.start) && contour.has(c.end);
+    for (let s = 0; s < SAMPLES; s++) {
+      const ang = Math.random() * Math.PI * 2;
+      const rad = 0.35 + Math.random() * 0.85;
+      pts.push({
+        a: c.start,
+        b: c.end,
+        t: (s + 0.5) / SAMPLES,
+        w: hot ? 2.6 : 1.0,          // feature contours burn brighter
+        sx: Math.cos(ang) * rad,     // scatter direction, fixed per point
+        sy: Math.sin(ang) * rad * 0.8,
+        ph: Math.random() * Math.PI * 2,
+      });
+    }
+  }
+  cloud = pts;
+}
+
+/* ------------------------------------------------------------------ *
+ * Finger counting.
+ * Distance from the wrist is rotation invariant, which matters because
+ * the hand is rarely upright on camera. A curled finger pulls its tip
+ * closer to the wrist than its own middle joint.
+ * ------------------------------------------------------------------ */
+const FINGERS = [
+  { tip: 4,  pip: 2,  ratio: 1.35 },   // thumb needs a wider margin
+  { tip: 8,  pip: 6,  ratio: 1.12 },
+  { tip: 12, pip: 10, ratio: 1.12 },
+  { tip: 16, pip: 14, ratio: 1.12 },
+  { tip: 20, pip: 18, ratio: 1.12 },
+];
+
+function dist(a, b) {
+  const dx = a.x - b.x, dy = a.y - b.y, dz = (a.z || 0) - (b.z || 0);
+  return Math.hypot(dx, dy, dz);
+}
+
+function countFingers(lm) {
+  const wrist = lm[0];
+  let n = 0;
+  for (const f of FINGERS) {
+    if (dist(lm[f.tip], wrist) > dist(lm[f.pip], wrist) * f.ratio) n++;
+  }
+  return n;
+}
+
+/* ------------------------------------------------------------------ *
+ * Drawing helpers
+ * ------------------------------------------------------------------ */
+const rgb  = (c, a = 1) => `rgba(${c[0]|0},${c[1]|0},${c[2]|0},${a})`;
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t * t * (3 - 2 * t);
+
+function neonPath(path, color, width, glow) {
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.shadowColor = rgb(color);
+  ctx.shadowBlur = glow;
+  ctx.strokeStyle = rgb(color, 0.9);
+  ctx.lineWidth = width;
+  ctx.stroke(path);
+  ctx.stroke(path);
+  ctx.shadowBlur = glow * 0.3;
+  ctx.strokeStyle = "rgba(255,255,255,0.92)";
+  ctx.lineWidth = Math.max(0.8, width * 0.34);
+  ctx.stroke(path);
+  ctx.restore();
+}
+
+/* ------------------------------------------------------------------ *
+ * Live face: low-poly wireframe with vertex dots
+ * ------------------------------------------------------------------ */
+function drawWireframe(lm) {
+  const pts = KEY.map(i => ({ x: sx(lm[i].x), y: sy(lm[i].y) }));
+
+  const path = new Path2D();
+  for (let i = 0; i < TRI.length; i++) {
+    const a = pts[TRI[i][0]], b = pts[TRI[i][1]], c = pts[TRI[i][2]];
+    path.moveTo(a.x, a.y);
+    path.lineTo(b.x, b.y);
+    path.lineTo(c.x, c.y);
+    path.closePath();
+  }
+
+  const scale = view.h / 720;
+  neonPath(path, colorNow, 2.0 * scale, 14 * scale);
+
+  ctx.save();
+  ctx.fillStyle = rgb(colorNow, 0.95);
+  ctx.shadowColor = rgb(colorNow);
+  ctx.shadowBlur = 8 * scale;
+  const r = 2.1 * scale;
+  for (const p of pts) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* ------------------------------------------------------------------ *
+ * Floating scan: dense point cloud, normalised to a fixed size and
+ * parked in the upper-left. Rendered into an intensity buffer so a few
+ * thousand points stay cheap, then composited with a blurred pass for
+ * the bloom.
+ * ------------------------------------------------------------------ */
+function drawScan(lm, now) {
+  // Normalise: centre on the face, scale by face height.
+  let cx = 0, cy = 0;
+  for (const i of OVAL) { cx += lm[i].x; cy += lm[i].y; }
+  cx /= OVAL.length; cy /= OVAL.length;
+
+  // Landmark x is normalised to frame width, so on a 16:9 camera one
+  // unit of x is wider than one unit of y. Undo that before scaling.
+  const ar = (video.videoWidth || 16) / (video.videoHeight || 9);
+  const span = Math.hypot((lm[152].x - lm[10].x) * ar, lm[152].y - lm[10].y) || 0.2;
+  const k = (MH * 0.74) / span;
+
+  const bobX = Math.sin(now / 2400) * 5;
+  const bobY = Math.cos(now / 1900) * 7;
+
+  const d = ease(dissolve);
+  const spread = d * MW * 0.30;
+
+  acc.fill(0);
+  let nTouched = 0;
+
+  for (let i = 0; i < cloud.length; i++) {
+    const p = cloud[i];
+    const A = lm[p.a], B = lm[p.b];
+
+    let x = (lerp(A.x, B.x, p.t) - cx) * ar * -k + MW / 2 + bobX;
+    let y = (lerp(A.y, B.y, p.t) - cy) *      k + MH / 2 + bobY;
+
+    if (d > 0.001) {
+      const drift = Math.sin(now / 700 + p.ph) * 6 * d;
+      x += p.sx * spread + drift;
+      y += p.sy * spread + Math.cos(now / 810 + p.ph) * 6 * d;
+    }
+
+    const px = x | 0, py = y | 0;
+    if (px < 0 || py < 0 || px >= MW || py >= MH) continue;
+    const idx = py * MW + px;
+    if (acc[idx] === 0) touched[nTouched++] = idx;
+    acc[idx] += p.w * (1 - d * 0.45);
+  }
+
+  // Intensity buffer -> RGBA. One native clear, then only the live pixels.
+  const data = maskImage.data;
+  data.fill(0);
+  const cr = colorNow[0], cg = colorNow[1], cb = colorNow[2];
+  for (let n = 0; n < nTouched; n++) {
+    const j = touched[n] * 4;
+    const v = acc[touched[n]];
+    // More points reach full opacity so the colour reads strongly, and only
+    // the very densest cores pick up a faint white centre. The old threshold
+    // whitened the eye, nose and lip contours, which are the most visible
+    // part, so the colour washed out exactly where it mattered.
+    const a = v > 0.7 ? 1 : v / 0.7;
+    const boost = v > 2.8 ? 0.3 : 0;
+    data[j]     = cr + (255 - cr) * boost;
+    data[j + 1] = cg + (255 - cg) * boost;
+    data[j + 2] = cb + (255 - cb) * boost;
+    data[j + 3] = 255 * a;
+  }
+  mctx.putImageData(maskImage, 0, 0);
+
+  // Composite: bloom pass, then the crisp points on top.
+  const s = view.h / 720;
+  const dh = SCAN_H * s;
+  const dw = MW * (SCAN_H / MH) * s;
+  const dx = view.x + view.w * 0.04;
+  const dy = view.y + view.h * 0.07;
+
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  if (ctx.filter !== undefined) {
+    ctx.filter = `blur(${6 * s}px)`;
+    ctx.globalAlpha = 0.85;
+    ctx.drawImage(maskCanvas, dx, dy, dw, dh);
+    ctx.filter = "none";
+  }
+  ctx.globalAlpha = 1;
+  ctx.drawImage(maskCanvas, dx, dy, dw, dh);
+  ctx.restore();
+}
+
+/* ------------------------------------------------------------------ *
+ * Landmark smoothing
+ * ------------------------------------------------------------------ */
+// Speed-adaptive smoothing (one-euro style). Slow drift is smoothed hard
+// so the mask stays calm, but fast motion like a blink passes through almost
+// raw so it reads clearly. `base` is the floor alpha, `fast` the ceiling,
+// and each landmark's own speed picks between them.
+function smooth(prev, next, base, fast) {
+  if (!prev || prev.length !== next.length) {
+    return next.map(p => ({ x: p.x, y: p.y, z: p.z }));
+  }
+  for (let i = 0; i < next.length; i++) {
+    const dx = next[i].x - prev[i].x;
+    const dy = next[i].y - prev[i].y;
+    const speed = Math.hypot(dx, dy);
+    const a = base + (fast - base) * Math.min(1, speed / 0.006);
+    prev[i].x += dx * a;
+    prev[i].y += dy * a;
+    prev[i].z += (next[i].z - prev[i].z) * a;
+  }
+  return prev;
+}
+
+/* ------------------------------------------------------------------ *
+ * Canvas sizing. The video is drawn cover-style so it always fills.
+ * ------------------------------------------------------------------ */
+let view = { x: 0, y: 0, w: 0, h: 0 };
+
+// Normalised landmark -> device pixels. x is flipped because the feed
+// is mirrored, and both axes ride the cover-fit rect rather than the
+// raw canvas, so the overlay stays glued to the face at any aspect.
+const sx = nx => canvas.width - view.x - nx * view.w;
+const sy = ny => view.y + ny * view.h;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width  = Math.round(window.innerWidth  * dpr);
+  canvas.height = Math.round(window.innerHeight * dpr);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+
+  const vw = video.videoWidth || 16, vh = video.videoHeight || 9;
+  const scale = Math.max(canvas.width / vw, canvas.height / vh);
+  view.w = vw * scale;
+  view.h = vh * scale;
+  view.x = (canvas.width  - view.w) / 2;
+  view.y = (canvas.height - view.h) / 2;
+}
+window.addEventListener("resize", resize);
+
+/* ------------------------------------------------------------------ *
+ * Focus by contrast.
+ *
+ * drawToView draws a source into the mirrored, cover-fit video rect. When
+ * darkening is on, the video is drawn through a contrast curve instead of a
+ * flat black layer. A flat layer dimmed the ring-lit face as much as the
+ * room; this keeps the bright, ring-lit face visible while pushing the dim
+ * background down toward black. It keys off brightness, so it follows your
+ * lighting rather than a fixed shape.
+ *
+ * brightness() lowers the whole frame a touch; contrast() then pulls tones
+ * apart around the midpoint, so lit skin stays up and the dark wall drops
+ * out. The mesh and scan are drawn afterwards, unfiltered, so they stay at
+ * full strength on top.
+ * ------------------------------------------------------------------ */
+const DARK_FILTER = "brightness(0.97) contrast(1.5)";
+
+function drawToView(src, filter) {
+  ctx.save();
+  ctx.translate(canvas.width, 0);
+  ctx.scale(-1, 1);
+  if (filter && ctx.filter !== undefined) ctx.filter = filter;
+  ctx.drawImage(src, canvas.width - view.x - view.w, view.y, view.w, view.h);
+  ctx.filter = "none";
+  ctx.restore();
+}
+
+
+/* ------------------------------------------------------------------ *
+ * Main loop
+ * ------------------------------------------------------------------ */
+function loop() {
+  requestAnimationFrame(loop);
+  if (video.readyState < 2) return;
+
+  const now = performance.now();
+  const dt = Math.min(now - lastFrame, 100);
+  lastFrame = now;
+  fpsAvg = fpsAvg ? fpsAvg * 0.92 + (1000 / dt) * 0.08 : 1000 / dt;
+
+  // Mirrored video fill. When darkening is on, the feed is drawn through a
+  // contrast curve so the ring-lit face stays visible and the dim room falls
+  // to black.
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = "#04060a";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  drawToView(video, darkOn ? DARK_FILTER : null);
+
+  const fresh = video.currentTime !== lastVideoTime;
+  if (fresh) lastVideoTime = video.currentTime;
+
+  // ---- Face ----
+  if (fresh && faceLandmarker) {
+    const res = faceLandmarker.detectForVideo(video, now);
+    if (res.faceLandmarks.length) {
+      const lm = res.faceLandmarks[0];
+      smoothFace = smooth(smoothFace, lm, 0.5,  0.9);   // live overlay, snappy
+      scanFace   = smooth(scanFace,   lm, 0.25, 0.85);  // floating mask, calm but blinks show
+    } else {
+      smoothFace = null;
+      scanFace = null;
+    }
+  }
+
+  // ---- Hands: half rate, the models are the expensive part ----
+  if (fresh && handLandmarker && (handTick++ % 2 === 0)) {
+    const res = handLandmarker.detectForVideo(video, now);
+    fingersRaw = res.landmarks.length ? countFingers(res.landmarks[0]) : 0;
+
+    fingerHistory.push(fingersRaw);
+    if (fingerHistory.length > 7) fingerHistory.shift();
+    const tally = new Array(6).fill(0);
+    for (const n of fingerHistory) tally[n]++;
+    fingers = tally.indexOf(Math.max(...tally));
+
+    // Open palm scatters the scan, a fist pulls it back together.
+    if (fingers === 5) dissolveTarget = 1;
+    else if (fingers <= 1) dissolveTarget = 0;
+  }
+
+  // Colour and dissolve both ease, so nothing snaps.
+  const target = PALETTE[fingers] || DEFAULT_COLOR;
+  // Colour eases in with a ~70ms time constant: smooth, but fast enough that
+  // a gesture change is obvious rather than a slow fade.
+  const ck = 1 - Math.exp(-dt / 70);
+  for (let i = 0; i < 3; i++) colorNow[i] = lerp(colorNow[i], target[i], ck);
+
+  // Scattering is a burst, reassembly is a slow drift home.
+  const dk = 1 - Math.pow(dissolveTarget > dissolve ? 0.0005 : 0.18, dt / 1000);
+  dissolve = lerp(dissolve, dissolveTarget, dk);
+
+  // ---- Overlays ----
+  if (scanFace && cloud) drawScan(scanFace, now);
+  if (smoothFace) drawWireframe(smoothFace);
+
+  // ---- HUD ----
+  if (hudVisible) {
+    fpsEl.textContent = "FPS: " + fpsAvg.toFixed(1);
+    fingEl.textContent = String(fingers);
+    scanEl.textContent = dissolve > 0.6 ? "scattered"
+                       : dissolve > 0.05 ? "reforming" : "locked";
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Boot
+ * ------------------------------------------------------------------ */
+async function start() {
+  goBtn.disabled = true;
+  goBtn.textContent = "Loading models";
+  errBox.textContent = "";
+
+  try {
+    const fileset = await FilesetResolver.forVisionTasks(WASM);
+
+    // Some machines have no usable WebGL delegate. Retry on CPU rather
+    // than dying at the loading screen.
+    const build = (Task, model, extra) => {
+      const make = delegate => Task.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: model, delegate },
+        runningMode: "VIDEO",
+        ...extra,
+      });
+      return make("GPU").catch(() => make("CPU"));
+    };
+
+    // Face and hand are required; the app is nothing without them.
+    [faceLandmarker, handLandmarker] = await Promise.all([
+      build(FaceLandmarker, FACE, { numFaces: 1, minFaceDetectionConfidence: 0.5, minTrackingConfidence: 0.5 }),
+      build(HandLandmarker, HAND, { numHands: 1, minHandDetectionConfidence: 0.5, minTrackingConfidence: 0.5 }),
+    ]);
+
+    buildCloud();
+
+    goBtn.textContent = "Waiting for camera";
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        width:  { ideal: 1920 },
+        height: { ideal: 1080 },
+        frameRate: { ideal: 30 },
+        facingMode: "user",
+      },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+
+    resize();
+    gate.classList.add("gone");
+    hudNodes.forEach(n => n.classList.remove("gone"));
+    loop();
+
+  } catch (e) {
+    goBtn.disabled = false;
+    goBtn.textContent = "Try again";
+    errBox.textContent =
+      e && e.name === "NotAllowedError"
+        ? "Camera access was blocked. Allow it in your browser's site settings, then try again."
+        : "Could not start: " + (e && e.message ? e.message : e);
+    console.error(e);
+  }
+}
+
+goBtn.addEventListener("click", start);
+
+document.addEventListener("keydown", e => {
+  if (e.repeat) return;
+  const k = e.key.toLowerCase();
+  if (k === " " || e.code === "Space") {
+    e.preventDefault();
+    dissolveTarget = dissolveTarget > 0.5 ? 0 : 1;
+  } else if (k === "f") {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen?.();
+  } else if (k === "h") {
+    hudVisible = !hudVisible;
+    hudNodes.forEach(n => n.classList.toggle("gone", !hudVisible));
+  } else if (k === "b") {
+    darkOn = !darkOn;   // toggle the full-frame darkening
+  }
+});
+</script>
+</body>
+</html>
